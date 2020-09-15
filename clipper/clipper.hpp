@@ -403,6 +403,19 @@ class clipperException : public std::exception
 
 } //ClipperLib namespace
 
+namespace std {
+	template <>
+	struct hash<ClipperLib::IntPoint> {
+		size_t operator()(const ClipperLib::IntPoint& pp) const
+		{
+			static int prime = 31;
+			int result = 89;
+			result = result * prime + pp.X;
+			result = result * prime + pp.Y;
+			return result;
+		}
+	};
+}
 #endif //clipper_hpp
 
 
