@@ -61,6 +61,19 @@
 
 namespace ClipperLib {
 
+static double const pi = 3.141592653589793238;
+static double const two_pi = pi * 2;
+static double const def_arc_tolerance = 0.25;
+
+static int const Unassigned = -1;  //edge not currently 'owning' a solution
+static int const Skip = -2;        //edge that would otherwise close a path
+
+#define HORIZONTAL (-1.0E+40)
+#define TOLERANCE (1.0e-20)
+#define NEAR_ZERO(val) (((val) > -TOLERANCE) && ((val) < TOLERANCE))
+
+enum Direction { dRightToLeft, dLeftToRight };
+
 enum ClipType { ctIntersection, ctUnion, ctDifference, ctXor };
 enum PolyType { ptSubject, ptClip };
 //By far the most widely used winding rules for polygon filling are
@@ -101,6 +114,178 @@ struct IntPoint {
     return a.X != b.X  || a.Y != b.Y; 
   }
 };
+
+struct IntRect { cInt left; cInt top; cInt right; cInt bottom; };
+
+//enums that are used internally ...
+enum EdgeSide { esLeft = 1, esRight = 2 };
+
+struct TEdge {
+	IntPoint Bot;
+	IntPoint Curr; //current (updated for every new scanbeam)
+	IntPoint Top;
+	double Dx;
+	PolyType PolyTyp;
+	EdgeSide Side; //side only refers to current side of solution poly
+	int WindDelta; //1 or -1 depending on winding direction
+	int WindCnt;
+	int WindCnt2; //winding count of the opposite polytype
+	int OutIdx;
+	TEdge* Next;
+	TEdge* Prev;
+	TEdge* NextInLML;
+	TEdge* NextInAEL;
+	TEdge* PrevInAEL;
+	TEdge* NextInSEL;
+	TEdge* PrevInSEL;
+};
+
+struct IntersectNode {
+	TEdge* Edge1;
+	TEdge* Edge2;
+	IntPoint        Pt;
+};
+
+struct LocalMinimum {
+	cInt          Y;
+	TEdge* LeftBound;
+	TEdge* RightBound;
+};
+
+struct LocMinSorter
+{
+	inline bool operator()(const LocalMinimum& locMin1, const LocalMinimum& locMin2)
+	{
+		return locMin2.Y < locMin1.Y;
+	}
+};
+
+TEdge* GetMaximaPair(TEdge* e);
+
+#ifndef use_int32
+
+//------------------------------------------------------------------------------
+// Int128 class (enables safe math on signed 64bit integers)
+// eg Int128 val1((long64)9223372036854775807); //ie 2^63 -1
+//    Int128 val2((long64)9223372036854775807);
+//    Int128 val3 = val1 * val2;
+//    val3.AsString => "85070591730234615847396907784232501249" (8.5e+37)
+//------------------------------------------------------------------------------
+
+class Int128
+{
+public:
+	ulong64 lo;
+	long64 hi;
+
+	Int128(long64 _lo = 0)
+	{
+		lo = (ulong64)_lo;
+		if (_lo < 0)  hi = -1; else hi = 0;
+	}
+
+
+	Int128(const Int128& val) : lo(val.lo), hi(val.hi) {}
+
+	Int128(const long64& _hi, const ulong64& _lo) : lo(_lo), hi(_hi) {}
+
+	Int128& operator = (const long64& val)
+	{
+		lo = (ulong64)val;
+		if (val < 0) hi = -1; else hi = 0;
+		return *this;
+	}
+	Int128& operator = (const Int128& val) = default;
+
+	bool operator == (const Int128& val) const
+	{
+		return (hi == val.hi && lo == val.lo);
+	}
+
+	bool operator != (const Int128& val) const
+	{
+		return !(*this == val);
+	}
+
+	bool operator > (const Int128& val) const
+	{
+		if (hi != val.hi)
+			return hi > val.hi;
+		else
+			return lo > val.lo;
+	}
+
+	bool operator < (const Int128& val) const
+	{
+		if (hi != val.hi)
+			return hi < val.hi;
+		else
+			return lo < val.lo;
+	}
+
+	bool operator >= (const Int128& val) const
+	{
+		return !(*this < val);
+	}
+
+	bool operator <= (const Int128& val) const
+	{
+		return !(*this > val);
+	}
+
+	Int128& operator += (const Int128& rhs)
+	{
+		hi += rhs.hi;
+		lo += rhs.lo;
+		if (lo < rhs.lo) hi++;
+		return *this;
+	}
+
+	Int128 operator + (const Int128& rhs) const
+	{
+		Int128 result(*this);
+		result += rhs;
+		return result;
+	}
+
+	Int128& operator -= (const Int128& rhs)
+	{
+		*this += -rhs;
+		return *this;
+	}
+
+	Int128 operator - (const Int128& rhs) const
+	{
+		Int128 result(*this);
+		result -= rhs;
+		return result;
+	}
+
+	Int128 operator-() const //unary negation
+	{
+		if (lo == 0)
+			return Int128(-hi, 0);
+		else
+			return Int128(~hi, ~lo + 1);
+	}
+
+	operator double() const
+	{
+		const double shift64 = 18446744073709551616.0; //2^64
+		if (hi < 0)
+		{
+			if (lo == 0) return (double)hi * shift64;
+			else return -(double)(~lo + ~hi * shift64);
+		}
+		else
+			return (double)(lo + hi * shift64);
+	}
+
+};
+
+Int128 Int128Mul(long64 lhs, long64 rhs);
+
+#endif
 //------------------------------------------------------------------------------
 
 typedef std::vector< IntPoint > Path;
@@ -109,9 +294,62 @@ typedef std::vector< Path > Paths;
 inline Path& operator <<(Path& poly, const IntPoint& p) {poly.push_back(p); return poly;}
 inline Paths& operator <<(Paths& polys, const Path& p) {polys.push_back(p); return polys;}
 
+inline bool IsHorizontal(TEdge& e)
+{
+	return e.Dx == HORIZONTAL;
+}
+//------------------------------------------------------------------------------
+
+inline double GetDx(const IntPoint pt1, const IntPoint pt2)
+{
+	return (pt1.Y == pt2.Y) ?
+		HORIZONTAL : (double)(pt2.X - pt1.X) / (pt2.Y - pt1.Y);
+}
+//---------------------------------------------------------------------------
+
+inline void SetDx(TEdge& e)
+{
+	cInt dy = (e.Top.Y - e.Bot.Y);
+	if (dy == 0) e.Dx = HORIZONTAL;
+	else e.Dx = (double)(e.Top.X - e.Bot.X) / dy;
+}
+//---------------------------------------------------------------------------
+
+inline void SwapSides(TEdge& Edge1, TEdge& Edge2)
+{
+	EdgeSide Side = Edge1.Side;
+	Edge1.Side = Edge2.Side;
+	Edge2.Side = Side;
+}
+//------------------------------------------------------------------------------
+
+inline void SwapPolyIndexes(TEdge& Edge1, TEdge& Edge2)
+{
+	int OutIdx = Edge1.OutIdx;
+	Edge1.OutIdx = Edge2.OutIdx;
+	Edge2.OutIdx = OutIdx;
+}
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+
+inline cInt Round(double val)
+{
+	if ((val < 0)) return static_cast<cInt>(val - 0.5);
+	else return static_cast<cInt>(val + 0.5);
+}
+
+inline cInt TopX(TEdge& edge, const cInt currentY)
+{
+	return (currentY == edge.Top.Y) ?
+		edge.Top.X : edge.Bot.X + Round(edge.Dx * (currentY - edge.Bot.Y));
+}
+
 std::ostream& operator <<(std::ostream &s, const IntPoint &p);
 std::ostream& operator <<(std::ostream &s, const Path &p);
 std::ostream& operator <<(std::ostream &s, const Paths &p);
+
+void save(const Paths& paths, const std::string& file);
+void load(Paths& paths, const std::string& file);
 
 struct DoublePoint
 {
@@ -132,6 +370,15 @@ enum EndType {etClosedPolygon, etClosedLine, etOpenButt, etOpenSquare, etOpenRou
 
 class PolyNode;
 typedef std::vector< PolyNode* > PolyNodes;
+
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+
+inline cInt Abs(cInt val)
+{
+	return val < 0 ? -val : val;
+}
 
 class PolyNode 
 { 
@@ -155,7 +402,58 @@ private:
     void AddChild(PolyNode& child);
     friend class Clipper; //to access Index
     friend class ClipperOffset; 
+	friend class ClipperOffsetEx;
+	friend class ClipperEx;
 };
+
+struct OutPt {
+	int       Idx;
+	IntPoint  Pt;
+	OutPt* Next;
+	OutPt* Prev;
+};
+
+//OutRec: contains a path in the clipping solution. Edges in the AEL will
+//carry a pointer to an OutRec when they are part of the clipping solution.
+struct OutRec {
+	int       Idx;
+	bool      IsHole;
+	bool      IsOpen;
+	OutRec* FirstLeft;  //see comments in clipper.pas
+	PolyNode* PolyNd;
+	OutPt* Pts;
+	OutPt* BottomPt;
+};
+
+
+
+struct Join {
+	OutPt* OutPt1;
+	OutPt* OutPt2;
+	IntPoint  OffPt;
+};
+
+OutRec* GetLowermostRec(OutRec* outRec1, OutRec* outRec2);
+bool OutRec1RightOfOutRec2(OutRec* outRec1, OutRec* outRec2);
+TEdge* GetMaximaPairEx(TEdge* e);
+
+void SwapIntersectNodes(IntersectNode& int1, IntersectNode& int2);
+bool GetOverlap(const cInt a1, const cInt a2, const cInt b1, const cInt b2,
+	cInt& Left, cInt& Right);
+
+bool JoinHorz(OutPt* op1, OutPt* op1b, OutPt* op2, OutPt* op2b,
+	const IntPoint Pt, bool DiscardLeft);
+
+TEdge* GetNextInAEL(TEdge* e, Direction dir);
+//------------------------------------------------------------------------------
+
+void GetHorzDirection(TEdge& HorzEdge, Direction& Dir, cInt& Left, cInt& Right);
+
+bool IntersectListSort(IntersectNode* node1, IntersectNode* node2);
+int PointCount(OutPt* Pts);
+
+OutPt* DupOutPt(OutPt* outPt, bool InsertAfter);
+//------------------------------------------------------------------------------
 
 class PolyTree: public PolyNode
 { 
@@ -168,6 +466,7 @@ private:
   //PolyTree& operator =(PolyTree& other);
   PolyNodes AllNodes;
     friend class Clipper; //to access AllNodes
+	friend class ClipperEx;
 };
 
 bool Orientation(const Path &poly);
@@ -194,10 +493,101 @@ void OpenPathsFromPolyTree(PolyTree& polytree, Paths& paths);
 void ReversePath(Path& p);
 void ReversePaths(Paths& p);
 
-struct IntRect { cInt left; cInt top; cInt right; cInt bottom; };
+bool Orientation(const Path& poly);
+//------------------------------------------------------------------------------
 
-//enums that are used internally ...
-enum EdgeSide { esLeft = 1, esRight = 2};
+double Area(const Path& poly);
+//------------------------------------------------------------------------------
+
+double Area(const OutPt* op);
+//------------------------------------------------------------------------------
+
+double Area(const OutRec& outRec);
+//------------------------------------------------------------------------------
+
+bool PointIsVertex(const IntPoint& Pt, OutPt* pp);
+//------------------------------------------------------------------------------
+
+//See "The Point in Polygon Problem for Arbitrary Polygons" by Hormann & Agathos
+//http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.88.5498&rep=rep1&type=pdf
+int PointInPolygon(const IntPoint& pt, const Path& path);
+//------------------------------------------------------------------------------
+
+int PointInPolygon(const IntPoint& pt, OutPt* op);
+//------------------------------------------------------------------------------
+
+bool Poly2ContainsPoly1(OutPt* OutPt1, OutPt* OutPt2);
+//----------------------------------------------------------------------
+
+bool SlopesEqual(const TEdge& e1, const TEdge& e2, bool UseFullInt64Range);
+//------------------------------------------------------------------------------
+
+bool SlopesEqual(const IntPoint pt1, const IntPoint pt2,
+	const IntPoint pt3, bool UseFullInt64Range);
+//------------------------------------------------------------------------------
+
+bool SlopesEqual(const IntPoint pt1, const IntPoint pt2,
+	const IntPoint pt3, const IntPoint pt4, bool UseFullInt64Range);
+//------------------------------------------------------------------------------
+
+
+//------------------------------------------------------------------------------
+
+void IntersectPoint(TEdge& Edge1, TEdge& Edge2, IntPoint& ip);
+//------------------------------------------------------------------------------
+
+void ReversePolyPtLinks(OutPt* pp);
+//------------------------------------------------------------------------------
+
+void DisposeOutPts(OutPt*& pp);
+//------------------------------------------------------------------------------
+
+inline void InitEdge(TEdge* e, TEdge* eNext, TEdge* ePrev, const IntPoint& Pt)
+{
+	std::memset(e, 0, sizeof(TEdge));
+	e->Next = eNext;
+	e->Prev = ePrev;
+	e->Curr = Pt;
+	e->OutIdx = Unassigned;
+}
+//------------------------------------------------------------------------------
+
+void InitEdge2(TEdge& e, PolyType Pt);
+//------------------------------------------------------------------------------
+
+TEdge* RemoveEdge(TEdge* e);
+//------------------------------------------------------------------------------
+
+inline void ReverseHorizontal(TEdge& e)
+{
+	//swap horizontal edges' Top and Bottom x's so they follow the natural
+	//progression of the bounds - ie so their xbots will align with the
+	//adjoining lower edge. [Helpful in the ProcessHorizontal() method.]
+	std::swap(e.Top.X, e.Bot.X);
+#ifdef use_xyz  
+	std::swap(e.Top.Z, e.Bot.Z);
+#endif
+}
+//------------------------------------------------------------------------------
+
+void SwapPoints(IntPoint& pt1, IntPoint& pt2);
+//------------------------------------------------------------------------------
+
+bool GetOverlapSegment(IntPoint pt1a, IntPoint pt1b, IntPoint pt2a,
+	IntPoint pt2b, IntPoint& pt1, IntPoint& pt2);
+//------------------------------------------------------------------------------
+
+bool FirstIsBottomPt(const OutPt* btmPt1, const OutPt* btmPt2);
+//------------------------------------------------------------------------------
+
+OutPt* GetBottomPt(OutPt* pp);
+//------------------------------------------------------------------------------
+bool Pt2IsBetweenPt1AndPt3(const IntPoint pt1,
+	const IntPoint pt2, const IntPoint pt3);
+//------------------------------------------------------------------------------
+bool HorzSegmentsOverlap(cInt seg1a, cInt seg1b, cInt seg2a, cInt seg2b);
+
+DoublePoint GetUnitNormal(const IntPoint& pt1, const IntPoint& pt2);
 
 //forward declarations (for stuff used internally) ...
 struct TEdge;
@@ -401,6 +791,134 @@ class clipperException : public std::exception
 };
 //------------------------------------------------------------------------------
 
+class ClipperEx : public virtual ClipperBase
+{
+public:
+	ClipperEx(int initOptions = 0);
+	bool Execute(ClipType clipType,
+		Paths& solution,
+		PolyFillType fillType = pftEvenOdd);
+	bool Execute(ClipType clipType,
+		Paths& solution,
+		PolyFillType subjFillType,
+		PolyFillType clipFillType);
+	bool Execute(ClipType clipType,
+		PolyTree& polytree,
+		PolyFillType fillType = pftEvenOdd);
+	bool Execute(ClipType clipType,
+		PolyTree& polytree,
+		PolyFillType subjFillType,
+		PolyFillType clipFillType);
+	bool ReverseSolution() { return m_ReverseOutput; };
+	void ReverseSolution(bool value) { m_ReverseOutput = value; };
+	bool StrictlySimple() { return m_StrictSimple; };
+	void StrictlySimple(bool value) { m_StrictSimple = value; };
+	//set the callback function for z value filling on intersections (otherwise Z is 0)
+#ifdef use_xyz
+	void ZFillFunction(ZFillCallback zFillFunc);
+#endif
+protected:
+	virtual bool ExecuteInternal();
+private:
+	JoinList         m_Joins;
+	JoinList         m_GhostJoins;
+	IntersectList    m_IntersectList;
+	ClipType         m_ClipType;
+	typedef std::list<cInt> MaximaList;
+	MaximaList       m_Maxima;
+	TEdge* m_SortedEdges;
+	bool             m_ExecuteLocked;
+	PolyFillType     m_ClipFillType;
+	PolyFillType     m_SubjFillType;
+	bool             m_ReverseOutput;
+	bool             m_UsingPolyTree;
+	bool             m_StrictSimple;
+#ifdef use_xyz
+	ZFillCallback   m_ZFill; //custom callback 
+#endif
+	void SetWindingCount(TEdge& edge);
+	bool IsEvenOddFillType(const TEdge& edge) const;
+	bool IsEvenOddAltFillType(const TEdge& edge) const;
+	void InsertLocalMinimaIntoAEL(const cInt botY);
+	void InsertEdgeIntoAEL(TEdge* edge, TEdge* startEdge);
+	void AddEdgeToSEL(TEdge* edge);
+	bool PopEdgeFromSEL(TEdge*& edge);
+	void CopyAELToSEL();
+	void DeleteFromSEL(TEdge* e);
+	void SwapPositionsInSEL(TEdge* edge1, TEdge* edge2);
+	bool IsContributing(const TEdge& edge) const;
+	bool IsTopHorz(const cInt XPos);
+	void DoMaxima(TEdge* e);
+	void ProcessHorizontals();
+	void ProcessHorizontal(TEdge* horzEdge);
+	void AddLocalMaxPoly(TEdge* e1, TEdge* e2, const IntPoint& pt);
+	OutPt* AddLocalMinPoly(TEdge* e1, TEdge* e2, const IntPoint& pt);
+	OutRec* GetOutRec(int idx);
+	void AppendPolygon(TEdge* e1, TEdge* e2);
+	void IntersectEdges(TEdge* e1, TEdge* e2, IntPoint& pt);
+	OutPt* AddOutPt(TEdge* e, const IntPoint& pt);
+	OutPt* GetLastOutPt(TEdge* e);
+	bool ProcessIntersections(const cInt topY);
+	void BuildIntersectList(const cInt topY);
+	void ProcessIntersectList();
+	void ProcessEdgesAtTopOfScanbeam(const cInt topY);
+	void BuildResult(Paths& polys);
+	void BuildResult2(PolyTree& polytree);
+	void SetHoleState(TEdge* e, OutRec* outrec);
+	void DisposeIntersectNodes();
+	bool FixupIntersectionOrder();
+	void FixupOutPolygon(OutRec& outrec);
+	void FixupOutPolyline(OutRec& outrec);
+	bool IsHole(TEdge* e);
+	bool FindOwnerFromSplitRecs(OutRec& outRec, OutRec*& currOrfl);
+	void FixHoleLinkage(OutRec& outrec);
+	void AddJoin(OutPt* op1, OutPt* op2, const IntPoint offPt);
+	void ClearJoins();
+	void ClearGhostJoins();
+	void AddGhostJoin(OutPt* op, const IntPoint offPt);
+	bool JoinPoints(Join* j, OutRec* outRec1, OutRec* outRec2);
+	void JoinCommonEdges();
+	void DoSimplePolygons();
+	void FixupFirstLefts1(OutRec* OldOutRec, OutRec* NewOutRec);
+	void FixupFirstLefts2(OutRec* InnerOutRec, OutRec* OuterOutRec);
+	void FixupFirstLefts3(OutRec* OldOutRec, OutRec* NewOutRec);
+#ifdef use_xyz
+	void SetZ(IntPoint& pt, TEdge& e1, TEdge& e2);
+#endif
+};
+
+class ClipperOffsetEx
+{
+public:
+	ClipperOffsetEx(double miterLimit = 2.0, double roundPrecision = 0.25);
+	~ClipperOffsetEx();
+	void AddPath(const Path& path, JoinType joinType, EndType endType);
+	void AddPaths(const Paths& paths, JoinType joinType, EndType endType);
+	void Execute(Paths& solution, double delta);
+	void Execute(PolyTree& solution, double delta);
+	void ExecuteConst(Paths& solution, double delta, int step = -1);
+	void Clear();
+	double MiterLimit;
+	double ArcTolerance;
+private:
+	Paths m_destPolys;
+	Path m_srcPoly;
+	Path m_destPoly;
+	std::vector<DoublePoint> m_normals;
+	double m_delta, m_sinA, m_sin, m_cos;
+	double m_miterLim, m_StepsPerRad;
+	IntPoint m_lowest;
+	PolyNode m_polyNodes;
+
+	void FixOrientations();
+	void DoOffset(double delta, int step);
+	void DoConstOffset(double delta, int step);
+	void OffsetPoint(int j, int& k, JoinType jointype);
+	void DoSquare(int j, int k);
+	void DoMiter(int j, int k, double r);
+	void DoRound(int j, int k);
+};
+
 } //ClipperLib namespace
 
 namespace std {
@@ -416,6 +934,10 @@ namespace std {
 		}
 	};
 }
+
+#define INT2MM(n) (float(n) / 1000.0f)
+typedef std::function<void(ClipperLib::PolyNode*)> polyNodeFunc;
+
 #endif //clipper_hpp
 
 

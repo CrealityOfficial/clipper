@@ -46,104 +46,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <ostream>
+#include <fstream>
 #include <functional>
+#include <fstream>
 
 namespace ClipperLib {
-
-static double const pi = 3.141592653589793238;
-static double const two_pi = pi *2;
-static double const def_arc_tolerance = 0.25;
-
-enum Direction { dRightToLeft, dLeftToRight };
-
-static int const Unassigned = -1;  //edge not currently 'owning' a solution
-static int const Skip = -2;        //edge that would otherwise close a path
-
-#define HORIZONTAL (-1.0E+40)
-#define TOLERANCE (1.0e-20)
-#define NEAR_ZERO(val) (((val) > -TOLERANCE) && ((val) < TOLERANCE))
-
-struct TEdge {
-  IntPoint Bot;
-  IntPoint Curr; //current (updated for every new scanbeam)
-  IntPoint Top;
-  double Dx;
-  PolyType PolyTyp;
-  EdgeSide Side; //side only refers to current side of solution poly
-  int WindDelta; //1 or -1 depending on winding direction
-  int WindCnt;
-  int WindCnt2; //winding count of the opposite polytype
-  int OutIdx;
-  TEdge *Next;
-  TEdge *Prev;
-  TEdge *NextInLML;
-  TEdge *NextInAEL;
-  TEdge *PrevInAEL;
-  TEdge *NextInSEL;
-  TEdge *PrevInSEL;
-};
-
-struct IntersectNode {
-  TEdge          *Edge1;
-  TEdge          *Edge2;
-  IntPoint        Pt;
-};
-
-struct LocalMinimum {
-  cInt          Y;
-  TEdge        *LeftBound;
-  TEdge        *RightBound;
-};
-
-struct OutPt;
-
-//OutRec: contains a path in the clipping solution. Edges in the AEL will
-//carry a pointer to an OutRec when they are part of the clipping solution.
-struct OutRec {
-  int       Idx;
-  bool      IsHole;
-  bool      IsOpen;
-  OutRec   *FirstLeft;  //see comments in clipper.pas
-  PolyNode *PolyNd;
-  OutPt    *Pts;
-  OutPt    *BottomPt;
-};
-
-struct OutPt {
-  int       Idx;
-  IntPoint  Pt;
-  OutPt    *Next;
-  OutPt    *Prev;
-};
-
-struct Join {
-  OutPt    *OutPt1;
-  OutPt    *OutPt2;
-  IntPoint  OffPt;
-};
-
-struct LocMinSorter
-{
-  inline bool operator()(const LocalMinimum& locMin1, const LocalMinimum& locMin2)
-  {
-    return locMin2.Y < locMin1.Y;
-  }
-};
-
-//------------------------------------------------------------------------------
-//------------------------------------------------------------------------------
-
-inline cInt Round(double val)
-{
-  if ((val < 0)) return static_cast<cInt>(val - 0.5); 
-  else return static_cast<cInt>(val + 0.5);
-}
-//------------------------------------------------------------------------------
-
-inline cInt Abs(cInt val)
-{
-  return val < 0 ? -val : val;
-}
 
 //------------------------------------------------------------------------------
 // PolyTree methods ...
@@ -237,120 +144,8 @@ bool PolyNode::IsOpen() const
   return m_IsOpen;
 }  
 //------------------------------------------------------------------------------
-
+//------------------------------------------------------------------------------
 #ifndef use_int32
-
-//------------------------------------------------------------------------------
-// Int128 class (enables safe math on signed 64bit integers)
-// eg Int128 val1((long64)9223372036854775807); //ie 2^63 -1
-//    Int128 val2((long64)9223372036854775807);
-//    Int128 val3 = val1 * val2;
-//    val3.AsString => "85070591730234615847396907784232501249" (8.5e+37)
-//------------------------------------------------------------------------------
-
-class Int128
-{
-  public:
-    ulong64 lo;
-    long64 hi;
-
-    Int128(long64 _lo = 0)
-    {
-      lo = (ulong64)_lo;   
-      if (_lo < 0)  hi = -1; else hi = 0; 
-    }
-
-
-    Int128(const Int128 &val): lo(val.lo), hi(val.hi){}
-
-    Int128(const long64& _hi, const ulong64& _lo): lo(_lo), hi(_hi){}
-    
-    Int128& operator = (const long64 &val)
-    {
-      lo = (ulong64)val;
-      if (val < 0) hi = -1; else hi = 0;
-      return *this;
-    }
-    Int128& operator = (const Int128 &val) = default;
-
-    bool operator == (const Int128 &val) const
-      {return (hi == val.hi && lo == val.lo);}
-
-    bool operator != (const Int128 &val) const
-      { return !(*this == val);}
-
-    bool operator > (const Int128 &val) const
-    {
-      if (hi != val.hi)
-        return hi > val.hi;
-      else
-        return lo > val.lo;
-    }
-
-    bool operator < (const Int128 &val) const
-    {
-      if (hi != val.hi)
-        return hi < val.hi;
-      else
-        return lo < val.lo;
-    }
-
-    bool operator >= (const Int128 &val) const
-      { return !(*this < val);}
-
-    bool operator <= (const Int128 &val) const
-      { return !(*this > val);}
-
-    Int128& operator += (const Int128 &rhs)
-    {
-      hi += rhs.hi;
-      lo += rhs.lo;
-      if (lo < rhs.lo) hi++;
-      return *this;
-    }
-
-    Int128 operator + (const Int128 &rhs) const
-    {
-      Int128 result(*this);
-      result+= rhs;
-      return result;
-    }
-
-    Int128& operator -= (const Int128 &rhs)
-    {
-      *this += -rhs;
-      return *this;
-    }
-
-    Int128 operator - (const Int128 &rhs) const
-    {
-      Int128 result(*this);
-      result -= rhs;
-      return result;
-    }
-
-    Int128 operator-() const //unary negation
-    {
-      if (lo == 0)
-        return Int128(-hi, 0);
-      else
-        return Int128(~hi, ~lo + 1);
-    }
-
-    operator double() const
-    {
-      const double shift64 = 18446744073709551616.0; //2^64
-      if (hi < 0)
-      {
-        if (lo == 0) return (double)hi * shift64;
-        else return -(double)(~lo + ~hi * shift64);
-      }
-      else
-        return (double)(lo + hi * shift64);
-    }
-
-};
-//------------------------------------------------------------------------------
 
 Int128 Int128Mul (long64 lhs, long64 rhs)
 {
@@ -576,48 +371,7 @@ bool SlopesEqual(const IntPoint pt1, const IntPoint pt2,
 }
 //------------------------------------------------------------------------------
 
-inline bool IsHorizontal(TEdge &e)
-{
-  return e.Dx == HORIZONTAL;
-}
-//------------------------------------------------------------------------------
 
-inline double GetDx(const IntPoint pt1, const IntPoint pt2)
-{
-  return (pt1.Y == pt2.Y) ?
-    HORIZONTAL : (double)(pt2.X - pt1.X) / (pt2.Y - pt1.Y);
-}
-//---------------------------------------------------------------------------
-
-inline void SetDx(TEdge &e)
-{
-  cInt dy  = (e.Top.Y - e.Bot.Y);
-  if (dy == 0) e.Dx = HORIZONTAL;
-  else e.Dx = (double)(e.Top.X - e.Bot.X) / dy;
-}
-//---------------------------------------------------------------------------
-
-inline void SwapSides(TEdge &Edge1, TEdge &Edge2)
-{
-  EdgeSide Side =  Edge1.Side;
-  Edge1.Side = Edge2.Side;
-  Edge2.Side = Side;
-}
-//------------------------------------------------------------------------------
-
-inline void SwapPolyIndexes(TEdge &Edge1, TEdge &Edge2)
-{
-  int OutIdx =  Edge1.OutIdx;
-  Edge1.OutIdx = Edge2.OutIdx;
-  Edge2.OutIdx = OutIdx;
-}
-//------------------------------------------------------------------------------
-
-inline cInt TopX(TEdge &edge, const cInt currentY)
-{
-  return ( currentY == edge.Top.Y ) ?
-    edge.Top.X : edge.Bot.X + Round(edge.Dx *(currentY - edge.Bot.Y));
-}
 //------------------------------------------------------------------------------
 
 void IntersectPoint(TEdge &Edge1, TEdge &Edge2, IntPoint &ip)
@@ -715,16 +469,7 @@ void DisposeOutPts(OutPt*& pp)
     delete tmpPp;
   }
 }
-//------------------------------------------------------------------------------
 
-inline void InitEdge(TEdge* e, TEdge* eNext, TEdge* ePrev, const IntPoint& Pt)
-{
-  std::memset(e, 0, sizeof(TEdge));
-  e->Next = eNext;
-  e->Prev = ePrev;
-  e->Curr = Pt;
-  e->OutIdx = Unassigned;
-}
 //------------------------------------------------------------------------------
 
 void InitEdge2(TEdge& e, PolyType Pt)
@@ -753,17 +498,6 @@ TEdge* RemoveEdge(TEdge* e)
   return result;
 }
 //------------------------------------------------------------------------------
-
-inline void ReverseHorizontal(TEdge &e)
-{
-  //swap horizontal edges' Top and Bottom x's so they follow the natural
-  //progression of the bounds - ie so their xbots will align with the
-  //adjoining lower edge. [Helpful in the ProcessHorizontal() method.]
-  std::swap(e.Top.X, e.Bot.X);
-#ifdef use_xyz  
-  std::swap(e.Top.Z, e.Bot.Z);
-#endif
-}
 //------------------------------------------------------------------------------
 
 void SwapPoints(IntPoint &pt1, IntPoint &pt2)
@@ -4800,5 +4534,51 @@ std::ostream& operator <<(std::ostream &s, const Paths &p)
   return s;
 }
 //------------------------------------------------------------------------------
+
+void save(const Paths& paths, const std::string& file)
+{
+	std::fstream out(file, std::ios::binary | std::ios::out);
+	if (out.is_open())
+	{
+		size_t size = paths.size();
+		out.write((const char*)& size, sizeof(size_t));
+		for (size_t i = 0; i < size; ++i)
+		{
+			const Path& path = paths.at(i);
+			size_t psize = path.size();
+			out.write((const char*)&psize, sizeof(size_t));
+			if(psize > 0)
+				out.write((const char*)&path.at(0), sizeof(IntPoint) * psize);
+		}
+	}
+	out.close();
+}
+
+void load(Paths& paths, const std::string& file)
+{
+	std::fstream in(file, std::ios::binary | std::ios::in);
+	if (in.is_open())
+	{
+		size_t size = 0;
+		in.read((char*)&size, sizeof(size_t));
+		if (size > 0)
+		{
+			paths.resize(size);
+			for (size_t i = 0; i < size; ++i)
+			{
+				Path& path = paths.at(i);
+				size_t psize = 0;
+				in.read((char*)&psize, sizeof(size_t));
+				if (psize > 0)
+				{
+					path.resize(psize);
+					in.read((char*)& path.at(0), sizeof(IntPoint) * psize);
+				}
+					
+			}
+		}
+	}
+	in.close();
+}
 
 } //ClipperLib namespace
