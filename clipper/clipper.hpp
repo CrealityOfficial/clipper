@@ -937,6 +937,7 @@ namespace std {
 
 #define INT2MM(n) (float(n) / 1000.0f)
 typedef std::function<void(ClipperLib::PolyNode*)> polyNodeFunc;
+typedef std::function<void(std::vector<ClipperLib::PolyNode*>&)> polyLevelFunc;
 
 #endif //clipper_hpp
 
