@@ -1,4 +1,7 @@
 #include <clipper.hpp>
+#include <cmath>
+#include <vector>
+#include <algorithm>
 
 namespace ClipperLib
 {
