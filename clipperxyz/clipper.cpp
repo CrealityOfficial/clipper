@@ -50,7 +50,7 @@
 #include <functional>
 #include <fstream>
 
-namespace ClipperLib {
+namespace ClipperLibXYZ {
 
 //------------------------------------------------------------------------------
 // PolyTree methods ...
@@ -376,6 +376,8 @@ bool SlopesEqual(const IntPoint pt1, const IntPoint pt2,
 
 void IntersectPoint(TEdge &Edge1, TEdge &Edge2, IntPoint &ip)
 {
+  ip.Z = 0;
+
   double b1, b2;
   if (Edge1.Dx == Edge2.Dx)
   {
@@ -1210,6 +1212,13 @@ Clipper::Clipper(int initOptions) : ClipperBase() //constructor
   m_StrictSimple = ((initOptions & ioStrictlySimple) != 0);
   m_PreserveCollinear = ((initOptions & ioPreserveCollinear) != 0);
   m_HasOpenPaths = false;
+  m_ZFill = 0;
+}
+//------------------------------------------------------------------------------
+
+void Clipper::ZFillFunction(ZFillCallback zFillFunc)
+{  
+  m_ZFill = zFillFunc;
 }
 //------------------------------------------------------------------------------
 
@@ -1810,10 +1819,23 @@ void Clipper::DeleteFromSEL(TEdge *e)
 }
 //------------------------------------------------------------------------------
 
+void Clipper::SetZ(IntPoint& pt, TEdge& e1, TEdge& e2)
+{
+  if (pt.Z != 0 || !m_ZFill) return;
+  else if (pt == e1.Bot) pt.Z = e1.Bot.Z;
+  else if (pt == e1.Top) pt.Z = e1.Top.Z;
+  else if (pt == e2.Bot) pt.Z = e2.Bot.Z;
+  else if (pt == e2.Top) pt.Z = e2.Top.Z;
+  else (*m_ZFill)(e1.Bot, e1.Top, e2.Bot, e2.Top, pt); 
+}
+//------------------------------------------------------------------------------
+
 void Clipper::IntersectEdges(TEdge *e1, TEdge *e2, IntPoint &Pt)
 {
   bool e1Contributing = ( e1->OutIdx >= 0 );
   bool e2Contributing = ( e2->OutIdx >= 0 );
+
+  SetZ(Pt, *e1, *e2);
 
 #ifdef use_lines
   //if either edge is on an OPEN path ...
@@ -2416,6 +2438,9 @@ void Clipper::ProcessHorizontal(TEdge *horzEdge)
 
     if (horzEdge->OutIdx >= 0 && !IsOpen)  //note: may be done multiple times
 		{
+			if (dir == dLeftToRight) SetZ(e->Curr, *horzEdge, *e);
+			else SetZ(e->Curr, *e, *horzEdge);
+
 			op1 = AddOutPt(horzEdge, e->Curr);
 			TEdge* eNextHorz = m_SortedEdges;
 			while (eNextHorz)
@@ -2742,6 +2767,7 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
       {
         e->Curr.X = TopX( *e, topY );
         e->Curr.Y = topY;
+		e->Curr.Z = topY == e->Top.Y ? e->Top.Z : (topY == e->Bot.Y ? e->Bot.Z : 0);
 	  }
 
       //When StrictlySimple and 'e' is being touched by another edge, then
@@ -2753,6 +2779,9 @@ void Clipper::ProcessEdgesAtTopOfScanbeam(const cInt topY)
           (ePrev->Curr.X == e->Curr.X) && (ePrev->WindDelta != 0))
         {
           IntPoint pt = e->Curr;
+#ifdef use_xyz
+          SetZ(pt, *ePrev, *e);
+#endif
           OutPt* op = AddOutPt(ePrev, pt);
           OutPt* op2 = AddOutPt(e, pt);
           AddJoin(op, op2, pt); //StrictlySimple (type-3) join
@@ -4539,4 +4568,4 @@ void load(Paths& paths, const std::string& file)
 	in.close();
 }
 
-} //ClipperLib namespace
+} //ClipperLibXYZ namespace
